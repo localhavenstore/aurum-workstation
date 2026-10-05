@@ -1,0 +1,1305 @@
+#!/usr/bin/python3 -B
+"""aurum-ws - Aurum Workstation v1 (SPEC lab/workstation/SPEC.md v0.7). Local AI on your existing Ubuntu, with undo.
+
+  sudo aurum-ws plan     [--privacy] [--theme] [--model TAG]   show what install would do (changes nothing)
+  sudo aurum-ws install  [--privacy] [--theme] [--model TAG]   do it (resumes an interrupted install)
+  sudo aurum-ws status                                        every step + a test answer + GPU line
+  sudo aurum-ws undo     [--purge-models] [--force]           remove what Aurum created (README: what is kept)
+
+Safety rules (SPEC): runs only as root from the root-owned stage; an existing Ollama is ADOPTED = only read, never
+changed (no pulls into it); installs no apt packages and no drivers; Ollama listens on 127.0.0.1 only; every change is
+recorded (with its pre-state) in /var/lib/aurum-ws/manifest.json BEFORE it is made, and an interrupted step is
+inspected (pre-state / intended state / something else -> stop) before anything is redone or undone; root never
+follows a path a user controls (user-scoped steps run AS that user).
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TEST_BUILD = (HERE / ".aurum-test-build").exists()         # never in a release tarball: test hooks are dead code there
+ROOT = Path(os.environ.get("AURUM_ROOT", "/")) if TEST_BUILD else Path("/")
+STATE = ROOT / "var/lib/aurum-ws"
+STAGE = STATE / "stage"
+MANIFEST = STATE / "manifest.json"
+LOCK = STATE / "lock"
+def cache_dir(m: dict) -> Path:
+    """Per-install download folder; its name carries the record id, so everything in it is Aurum's by construction."""
+    return STATE / f"cache-{m['id']}"
+OLLAMA_DIR = ROOT / "usr/local/lib"
+OLLAMA_LINK = ROOT / "usr/local/bin/ollama"
+CLI_LINK = ROOT / "usr/local/sbin/aurum-ws"
+UNIT = ROOT / "etc/systemd/system/ollama.service"
+MODELS_DIR = ROOT / "var/lib/ollama"
+APPORT = ROOT / "etc/default/apport"
+POPCON = ROOT / "etc/popularity-contest.conf"
+API = (os.environ.get("AURUM_OLLAMA_API") if TEST_BUILD else None) or "http://127.0.0.1:11434"
+OWN_MARK = ".aurum-ws-owned"                                # written inside the Ollama dir BEFORE it is moved in place
+ANSWER_S = 120
+
+
+class Kept(str):
+    """An undo result that KEEPS something on purpose: the step is re-checked on every later undo run (so a later
+    'undo --purge-models' still removes a model an earlier plain undo kept)."""
+
+
+class Stop(Exception):
+    """A clear, user-facing reason to stop (nothing half-done is left unrecorded)."""
+
+
+def say(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _die_with_parent():                                    # a killed installer never leaves curl/tar running
+    try:
+        ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)   # PR_SET_PDEATHSIG
+    except OSError:
+        pass
+
+
+def run(cmd: list[str], check=True, timeout=None, **kw) -> subprocess.CompletedProcess:
+    r = subprocess.run(cmd, capture_output=True, text=True, preexec_fn=_die_with_parent, timeout=timeout, **kw)
+    if check and r.returncode != 0:
+        raise Stop(f"command failed: {cmd[0]} {' '.join(cmd[1:3])} ... ({r.stderr.strip()[:200]})")
+    return r
+
+
+# ---------- release metadata (validated before any privileged work) ----------
+def load_release() -> dict:
+    r = json.loads((HERE / "release.json").read_text())
+    hx = re.compile(r"^[0-9a-f]{64}$")
+    o = r["ollama"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", o["version"]) and hx.match(o["sha256"]) and isinstance(o["size"], int)
+    assert o["url"] == f"https://github.com/ollama/ollama/releases/download/v{o['version']}/ollama-linux-amd64.tar.zst"
+    mins = [m["min_ram_gb"] for m in r["models"]]
+    assert mins == sorted(set(mins)) and mins[0] == 0
+    for m in r["models"]:
+        assert re.fullmatch(r"[a-z0-9.-]+:[a-z0-9.-]+", m["tag"]) and hx.match(m["digest"]) and isinstance(m["size"], int)
+    assert set(r["ubuntu"]) <= {"24.04", "26.04"}
+    return r
+
+
+try:
+    REL = load_release()
+except (OSError, ValueError, KeyError, AssertionError, TypeError):
+    if (str(HERE).startswith(str(STAGE) + "/") and HERE.is_dir() and set(os.listdir(HERE)) == {"aurum-ws"}
+            and sys.argv[1:2] == ["undo"]):
+        # a power cut hit between the last two steps of an undo: only this script is left - finish removing it
+        if os.geteuid() != 0:
+            print("STOPPED: run with sudo"); sys.exit(1)
+        (HERE / "aurum-ws").unlink()
+        HERE.rmdir()
+        try:
+            STAGE.rmdir()
+        except OSError:
+            pass
+        print("Undo complete (removed the last staged file).")
+        sys.exit(0)
+    print("STOPPED: release.json is damaged - stage the release again (README step 3)")
+    sys.exit(1)
+
+
+# ---------- safe filesystem ----------
+def root_dir(p: Path, mode: int) -> Path:
+    """p must be a real directory owned by root and not writable by others (created if absent)."""
+    try:
+        st = p.lstat()
+    except FileNotFoundError:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        os.mkdir(p, mode)
+        st = p.lstat()
+    if not stat.S_ISDIR(st.st_mode) or (not TEST_BUILD and st.st_uid != 0) or st.st_mode & 0o022:
+        raise Stop(f"{p} is not a root-owned real directory - refusing to use it")
+    os.chmod(p, mode)
+    return p
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600, uid: int | None = None, gid: int | None = None) -> None:
+    """Write via an exclusive no-follow temp file in a checked dir, fsync, rename, fsync the dir."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        if uid is not None:
+            os.fchown(fd, uid, gid if gid is not None else -1)
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def sha_nofollow(p: Path) -> str | None:
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        h = hashlib.sha256()
+        while c := os.read(fd, 1 << 20):
+            h.update(c)
+        return h.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def file_state(p: Path) -> dict:
+    """Everything undo needs to restore a system file exactly (type, owner, mode, content)."""
+    try:
+        st = p.lstat()
+    except FileNotFoundError:
+        return {"type": "absent"}
+    if stat.S_ISLNK(st.st_mode):
+        return {"type": "symlink", "target": os.readlink(p)}
+    if not stat.S_ISREG(st.st_mode):
+        return {"type": "other"}
+    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        data = b""
+        while c := os.read(fd, 1 << 16):
+            data += c
+    finally:
+        os.close(fd)
+    return {"type": "file", "uid": st.st_uid, "gid": st.st_gid, "mode": stat.S_IMODE(st.st_mode),
+            "content": data.decode("utf-8", "surrogateescape"), "sha": hashlib.sha256(data).hexdigest()}
+
+
+# ---------- manifest ----------
+def load_manifest() -> dict | None:
+    try:
+        st = MANIFEST.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or (not TEST_BUILD and (st.st_uid != 0 or st.st_mode & 0o077)):
+        raise Stop(f"{MANIFEST} is not a root-only file - refusing to trust it (no guessing)")
+    try:
+        m = json.loads(MANIFEST.read_text())
+        assert isinstance(m, dict) and isinstance(m.get("steps"), list)
+        assert m.get("state") in ("INSTALLING", "INSTALLED", "INSTALLED_WITH_PROBLEM", "UNDOING")
+        for s in m["steps"]:
+            assert s["state"] in ("INTENT", "DONE", "UNDONE", "UNDO_FAILED", "SKIPPED", "KEPT") and isinstance(s["id"], str)
+    except (ValueError, AssertionError, KeyError, TypeError):
+        raise Stop(f"{MANIFEST} is damaged - Aurum refuses to guess; it contains: {MANIFEST.read_text()[:300]!r}")
+    return m
+
+
+def save_manifest(m: dict) -> None:
+    atomic_write(MANIFEST, json.dumps(m, indent=1, sort_keys=True).encode())
+
+
+def step(m: dict | None, sid: str) -> dict | None:
+    return next((s for s in m["steps"] if s["id"] == sid), None) if m else None
+
+
+def kill_point(sid: str, point: str) -> None:
+    """Test builds only: die like a power cut at '<step>:intent' (recorded, nothing done) or '<step>:done' (done, not recorded)."""
+    if TEST_BUILD and os.environ.get("AURUM_TEST_KILL_AT") == f"{sid}:{point}":
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def begin(m: dict, sid: str, kind: str, resource: str, pre, post=None) -> dict:
+    """Record INTENT (with the pre-state and the intended post-state) BEFORE the change."""
+    s = step(m, sid)
+    if s is None:
+        s = {"id": sid, "kind": kind, "resource": resource, "pre": pre, "post": post, "state": "INTENT", "t": time.time()}
+        m["steps"].append(s)
+    else:
+        s.update(state="INTENT")
+        if post is not None:
+            s["post"] = post
+    save_manifest(m)
+    kill_point(sid, "intent")
+    return s
+
+
+def done(m: dict, s: dict, **post) -> None:
+    kill_point(s["id"], "done")
+    s["state"] = "DONE"
+    if post:
+        s["post"] = {**(s.get("post") or {}), **post}
+    save_manifest(m)
+
+
+def skipped(m: dict, sid: str, kind: str, resource: str, pre, note: str) -> None:
+    s = step(m, sid) or begin(m, sid, kind, resource, pre)
+    s.update(state="SKIPPED", note=note)
+    save_manifest(m)
+
+
+def other_state(what: str) -> Stop:
+    return Stop(f"{what} is in a state Aurum did not create (changed by someone else?) - stopping without touching it")
+
+
+class Locked:
+    def __enter__(self):
+        root_dir(STATE, 0o755)
+        fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        self.f = os.fdopen(fd, "r+")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Stop("another aurum-ws run is active (lock held) - wait for it to finish")
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+
+# ---------- host checks ----------
+def os_release() -> dict:
+    out = {}
+    for line in (ROOT / "etc/os-release").read_text().splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k] = v.strip().strip('"')
+    return out
+
+
+def check_stage() -> None:
+    """The running code and every ancestor up to / must be root-owned and not writable by others."""
+    if TEST_BUILD:
+        return
+    if not str(HERE).startswith(str(STAGE) + "/"):
+        raise Stop(f"run the staged copy under {STAGE} (README step 3) - not {HERE}")
+    p = HERE
+    while True:
+        st = p.lstat()
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise Stop(f"{p} is not a root-owned, non-writable real directory - stage again (README step 3)")
+        if p == p.parent:
+            break
+        p = p.parent
+    for f in HERE.rglob("*"):
+        st = f.lstat()
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise Stop(f"staged file {f} is not root-owned or is writable by others - stage again (README step 3)")
+
+
+def check_host(need_root=True) -> dict:
+    if need_root and os.geteuid() != 0 and not TEST_BUILD:
+        raise Stop("run with sudo (it changes system files); see the README")
+    check_stage()
+    osr = os_release()
+    if osr.get("ID") != "ubuntu" or osr.get("VERSION_ID") not in REL["ubuntu"]:
+        raise Stop(f"supported: Ubuntu {' / '.join(REL['ubuntu'])}; this is {osr.get('PRETTY_NAME', '?')}")
+    if os.uname().machine != "x86_64":
+        raise Stop("supported: x86_64 only in v1")
+    if "microsoft" in Path("/proc/version").read_text().lower():
+        raise Stop("WSL is not supported in v1")
+    for tool in ("curl", "zstd", "tar", "minisign"):
+        if not shutil.which(tool):
+            raise Stop(f"missing tool '{tool}': run  sudo apt install curl zstd minisign  first (README step 1)")
+    return osr
+
+
+def ram_gb() -> int:
+    kb = int(re.search(r"MemTotal:\s+(\d+)", Path("/proc/meminfo").read_text()).group(1))
+    return int(round(kb * 1024 / 1e9))
+
+
+def free_gb(path: Path) -> float:
+    p = path
+    while not p.exists():
+        p = p.parent
+    return shutil.disk_usage(p).free / 1e9
+
+
+def gpus() -> list[str]:
+    names = {"0x10de": "NVIDIA", "0x1002": "AMD", "0x8086": "Intel"}
+    out = []
+    for v in sorted(Path("/sys/class/drm").glob("card[0-9]*/device/vendor")):
+        try:
+            out.append(names.get(v.read_text().strip(), "other"))
+        except OSError:
+            pass
+    return sorted(set(out))
+
+
+def pick_model(ram: int, want: str | None) -> dict:
+    ms = REL["models"]
+    if want:
+        m = next((x for x in ms if x["tag"] == want), None)
+        if not m:
+            raise Stop(f"--model must be one of: {', '.join(x['tag'] for x in ms)}")
+        return m
+    return [x for x in ms if ram >= x["min_ram_gb"]][-1]
+
+
+def port_busy(port: int = 11434) -> bool:
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def existing_ollama() -> dict:
+    binp = shutil.which("ollama")
+    r = run(["systemctl", "list-unit-files", "--no-legend", "ollama.service"], check=False)
+    unit = r.stdout.split()[0] if r.returncode == 0 and r.stdout.strip() else None
+    try:
+        user = pwd.getpwnam("ollama").pw_uid
+    except KeyError:
+        user = None
+    return {"binary": binp, "unit": unit, "user": user, "port_busy": port_busy()}
+
+
+def invoking_user():
+    name = os.environ.get("SUDO_USER")
+    if not name or name == "root":
+        return None
+    return pwd.getpwnam(name)
+
+
+def as_user(pw, cmd: list[str], check=True, **kw):
+    bus = f"unix:path=/run/user/{pw.pw_uid}/bus"
+    return run(["runuser", "-u", pw.pw_name, "--", "env", f"DBUS_SESSION_BUS_ADDRESS={bus}", f"HOME={pw.pw_dir}", *cmd],
+               check=check, **kw)
+
+
+# ---------- Ollama API ----------
+def api(path: str, body=None, timeout=30, method=None):
+    req = urllib.request.Request(API + path, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"},
+                                 method=method or ("GET" if body is None else "POST"))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read(1 << 22) or b"{}")
+
+
+def tags() -> dict:
+    return {m["name"]: m["digest"] for m in api("/api/tags").get("models", [])}
+
+
+def api_delete(tag: str) -> None:
+    """Raises if Ollama does not confirm the delete (never reported as removed when it is not)."""
+    api("/api/delete", {"model": tag}, timeout=60, method="DELETE")
+    if tag in tags():
+        raise Stop(f"Ollama did not delete {tag}")
+
+
+def wait_api(seconds=60, version: str | None = None) -> None:
+    """Wait for Ollama; with version= it must be exactly that version (not something else on the port)."""
+    end, seen = time.time() + seconds, None
+    while time.time() < end:
+        try:
+            seen = api("/api/version", timeout=3).get("version")
+            if version is None or seen == version:
+                return
+        except Exception:
+            pass
+        time.sleep(1)
+    raise Stop("Ollama did not answer on 127.0.0.1:11434" + (f" (got version {seen}, expected {version})" if seen else ""))
+
+
+UNIT_TEXT = """[Unit]
+Description=Ollama (installed by Aurum Workstation; localhost only)
+After=network-online.target
+
+[Service]
+User=ollama
+Group=ollama
+Environment=OLLAMA_HOST=127.0.0.1:11434
+Environment=OLLAMA_MODELS=/var/lib/ollama/models
+ExecStart={exe} serve
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/ollama
+
+[Install]
+WantedBy=multi-user.target
+"""
+UNIT_SHA = hashlib.sha256(UNIT_TEXT.format(exe=OLLAMA_LINK).encode()).hexdigest()
+
+
+def ollama_dest() -> Path:
+    return OLLAMA_DIR / f"ollama-{REL['ollama']['version']}"
+
+
+def tree_list(p: Path) -> list[str]:
+    return sorted(str(f.relative_to(p)) for f in p.rglob("*"))
+
+
+def tree_inventory(p: Path) -> dict:
+    """relative path -> sha256 (files) / 'link:<target>' / 'dir' - undo removes the tree only if it is exactly this."""
+    out = {}
+    for f in sorted(p.rglob("*")):
+        rel = str(f.relative_to(p))
+        if f.is_symlink():
+            out[rel] = "link:" + os.readlink(f)
+        elif f.is_dir():
+            out[rel] = "dir"
+        else:
+            out[rel] = sha_nofollow(f) or "special"
+    return out
+
+
+# ---------- plan (what install would do; also used by install) ----------
+def install_steps(opts: dict, m: dict | None) -> list[tuple[str, str]]:
+    ex = existing_ollama()
+    ours = bool(m and any(s["id"] in ("ollama-files", "ollama-unit") and s["state"] in ("DONE", "INTENT") for s in m["steps"]))
+    adopted = bool(m and step(m, "adopt-ollama"))
+    adopt = adopted or (bool(ex["binary"] or ex["unit"]) and not ours)
+    if not adopt and not ours and ex["port_busy"]:
+        raise Stop("something else already listens on 127.0.0.1:11434 - stop it first (Aurum never changes it)")
+    ver = REL["ollama"]["version"]
+    out = []
+    if adopt:
+        out.append(("adopt-ollama", "use your EXISTING Ollama - Aurum only reads it, never changes or removes it"))
+    else:
+        out += [("ollama-files", f"download Ollama {ver} ({REL['ollama']['size'] / 1e9:.1f} GB, sha256 pinned) into {ollama_dest()}"),
+                ("ollama-link", f"create {OLLAMA_LINK} (link)"),
+                ("ollama-user", "create the system user 'ollama' (kept by undo)" if ex["user"] is None or ours else "use the existing user 'ollama'"),
+                ("models-dir", f"create {MODELS_DIR} (models)"),
+                ("ollama-unit", "create + start ollama.service, listening on 127.0.0.1:11434 only")]
+    mdl = pick_model(ram_gb(), opts.get("model"))
+    out.append((f"model-{mdl['tag']}", f"model {mdl['tag']} ({mdl['size'] / 1e9:.1f} GB, digest pinned)" +
+                (" - only if your Ollama already has it with the pinned digest (Aurum never pulls into it)" if adopt
+                 else " - an existing copy with the pinned digest is used as it is")))
+    out.append(("cli-link", f"create {CLI_LINK} (so 'sudo aurum-ws undo' works later)"))
+    if opts.get("privacy"):
+        out += [("privacy-apport", "crash reporter apport: enabled=0 + service off (old file + state recorded)"),
+                ("privacy-popcon", "popularity-contest: PARTICIPATE=\"no\" (only if installed)"),
+                ("privacy-ubuntu-report", "ubuntu-report: send no (for you)")]
+    if opts.get("theme"):
+        out.append(("theme-wallpaper", "Aurum wallpaper in your GNOME session (old values recorded)"))
+    return out
+
+
+# ---------- steps (each: inspect an interrupted step -> pre-state / intended / other) ----------
+def st_adopt(m, sid, opts):
+    skipped(m, sid, "adopt", "ollama", existing_ollama(), "existing Ollama - read only")
+    wait_api(10)
+
+
+def st_files(m, sid, opts):
+    dest, s = ollama_dest(), step(m, sid)
+    mark = sha_nofollow(dest / OWN_MARK)
+    if s and s["state"] == "INTENT":
+        if mark is not None and (dest / OWN_MARK).read_text().strip() == m["id"]:
+            done(m, s, files=tree_list(dest), inventory=tree_inventory(dest), exe_sha=sha_nofollow(dest / "bin/ollama")); return
+        if dest.exists() or dest.is_symlink():
+            raise other_state(str(dest))
+    elif dest.exists() or dest.is_symlink():
+        raise Stop(f"{dest} already exists but was not made by Aurum - not touching it")
+    if free_gb(OLLAMA_DIR) < REL["ollama"]["size"] * 3.5 / 1e9:
+        raise Stop("not enough free disk space for Ollama (download + unpacked) - nothing installed")
+    s = s or begin(m, sid, "dir", str(dest), {"type": "absent"})
+    cache = root_dir(cache_dir(m), 0o700)
+    final = cache / f"ollama-{REL['ollama']['version']}.tar.zst"
+    seed = os.environ.get("AURUM_TEST_SEED") if TEST_BUILD else None          # tests: skip re-downloading 1.4 GB
+    if seed and sha_nofollow(final) is None:
+        shutil.copyfile(seed, final)
+        os.chmod(final, 0o600)
+    if sha_nofollow(final) != REL["ollama"]["sha256"]:
+        part = cache / f".download.{os.getpid()}"
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+        try:
+            run(["curl", "-fsSL", "--retry", "3", "--proto", "=https", "--max-filesize", str(REL["ollama"]["size"]),
+                 "-o", str(part), REL["ollama"]["url"]], timeout=7200)
+            if sha_nofollow(part) != REL["ollama"]["sha256"]:
+                raise Stop("Ollama download does not match the pinned sha256 - nothing installed")
+            os.replace(part, final)
+        finally:
+            part.unlink(missing_ok=True)
+    for note in remove_own_partials(m):                                        # only OUR leftovers (mark = this record)
+        say(f"  {note}")
+    tmp = OLLAMA_DIR / f".ollama-{REL['ollama']['version']}.partial{os.getpid()}"
+    os.mkdir(tmp, 0o755)
+    atomic_write(tmp / OWN_MARK, (m["id"] + "\n").encode(), 0o644)            # mark FIRST: a crash leaves a provable leftover
+    run(["tar", "--zstd", "-xf", str(final), "-C", str(tmp), "--no-same-owner", "--no-overwrite-dir"], timeout=3600)
+    tmp_real = tmp.resolve()
+    escapes = [p for p in tmp.rglob("*") if p.is_symlink() and tmp_real not in (p.parent / os.readlink(p)).resolve().parents]
+    if not (tmp / "bin/ollama").is_file() or escapes:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise Stop("unexpected Ollama archive layout - nothing installed")
+    os.replace(tmp, dest)
+    done(m, s, files=tree_list(dest), inventory=tree_inventory(dest), exe_sha=sha_nofollow(dest / "bin/ollama"))
+
+
+def _link_step(m, sid, link: Path, target: Path):
+    s = step(m, sid)
+    cur = os.readlink(link) if link.is_symlink() else None
+    if cur == str(target):
+        done(m, s or begin(m, sid, "link", str(link), {"type": "absent"}, {"target": str(target)})); return
+    if link.exists() or link.is_symlink():
+        raise (other_state(str(link)) if s else Stop(f"{link} exists and is not Aurum's - not touching it"))
+    s = s or begin(m, sid, "link", str(link), {"type": "absent"}, {"target": str(target)})
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(target, link)
+    done(m, s)
+
+
+def st_link(m, sid, opts):
+    _link_step(m, sid, OLLAMA_LINK, ollama_dest() / "bin/ollama")
+
+
+def st_cli(m, sid, opts):
+    _link_step(m, sid, CLI_LINK, HERE / "aurum-ws")
+
+
+def st_user(m, sid, opts):
+    s = step(m, sid)
+    try:
+        pwd.getpwnam("ollama")
+        exists = True
+    except KeyError:
+        exists = False
+    if exists:                                             # never removed by undo, so 'ours or not' does no harm
+        if s and s["state"] == "INTENT":
+            done(m, s)
+        elif not s:
+            skipped(m, sid, "user", "ollama", {"type": "present"}, "existing account used")
+        return
+    s = s or begin(m, sid, "user", "ollama", {"type": "absent"})
+    run(["useradd", "--system", "--user-group", "--home-dir", str(MODELS_DIR), "--no-create-home",
+         "--shell", "/usr/sbin/nologin", "ollama"])
+    done(m, s)
+
+
+def st_models_dir(m, sid, opts):
+    s = step(m, sid)
+    pw = pwd.getpwnam("ollama")
+    try:
+        st = MODELS_DIR.lstat()
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        ours = (s and s["state"] == "INTENT" and stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode)
+                and st.st_uid in (0, pw.pw_uid) and stat.S_IMODE(st.st_mode) == 0o750 and st.st_ctime >= s["t"] - 1
+                and set(os.listdir(MODELS_DIR)) <= {"models"}
+                and (not (MODELS_DIR / "models").exists() or (not (MODELS_DIR / "models").is_symlink()
+                                                               and not os.listdir(MODELS_DIR / "models"))))
+        if ours:
+            pass                                           # exactly our half-done mkdir (empty): finish it below
+        elif s and s["state"] == "INTENT":
+            raise other_state(str(MODELS_DIR))
+        else:
+            skipped(m, sid, "dir", str(MODELS_DIR), {"type": "present"}, "existing folder used"); return
+    s = s or begin(m, sid, "dir", str(MODELS_DIR), {"type": "absent"})
+    for p in (MODELS_DIR, MODELS_DIR / "models"):
+        try:
+            os.mkdir(p, 0o750)
+        except FileExistsError:
+            pass
+        st = p.lstat()
+        if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            raise other_state(str(p))
+        os.chown(p, pw.pw_uid, pw.pw_gid, follow_symlinks=False)
+        os.chmod(p, 0o750)
+    done(m, s)
+
+
+def st_unit(m, sid, opts):
+    s = step(m, sid)
+    cur = file_state(UNIT)
+    if cur["type"] != "absent":
+        if cur.get("sha") != UNIT_SHA:
+            raise (other_state(str(UNIT)) if s else Stop(f"{UNIT} exists and is not Aurum's - not touching it"))
+    s = s or begin(m, sid, "unit", str(UNIT), {"type": "absent"}, {"sha": UNIT_SHA})
+    if cur["type"] == "absent":
+        atomic_write(UNIT, UNIT_TEXT.format(exe=OLLAMA_LINK).encode(), 0o644)
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "reset-failed", "ollama.service"], check=False)
+    run(["systemctl", "enable", "--now", "ollama.service"])
+    wait_api(90, REL["ollama"]["version"])
+    done(m, s, sha=UNIT_SHA)
+
+
+def st_model(m, sid, opts):
+    tag = sid[len("model-"):]
+    want = next(x for x in REL["models"] if x["tag"] == tag)
+    adopted = bool(step(m, "adopt-ollama"))
+    wait_api(30)
+    have, s = tags(), step(m, sid)
+    if s and s["state"] == "INTENT":                       # interrupted pull: pinned digest = ours; other = stop
+        if have.get(tag) == want["digest"]:
+            done(m, s, digest=have[tag]); return
+        if tag in have:
+            raise other_state(f"model {tag}")
+    elif tag in have:
+        note = "your copy is used" if have[tag] == want["digest"] else "your copy differs from the tested one - not used, not touched"
+        skipped(m, sid, "model", tag, {"type": "present", "digest": have[tag]}, note)
+        if have[tag] != want["digest"]:
+            say(f"  {tag}: {note}")
+        return
+    if adopted:
+        skipped(m, sid, "model", tag, {"type": "absent"}, "not in your Ollama - Aurum never pulls into an existing Ollama")
+        say(f"  {tag} is not in your Ollama. Aurum does not change your Ollama: run  ollama pull {tag}  yourself if you want it.")
+        return
+    if free_gb(MODELS_DIR) < want["size"] / 1e9 + 5:
+        raise Stop(f"not enough free disk for {tag} (+5 GB) - nothing downloaded")
+    s = s or begin(m, sid, "model", tag, {"type": "absent"}, {"digest": want["digest"]})
+    try:
+        api("/api/pull", {"model": tag, "stream": False}, timeout=7200)
+    except Exception as exc:
+        raise Stop(f"downloading {tag} failed ({type(exc).__name__}: {str(exc)[:120]}) - check your internet, then run install again")
+    got = tags().get(tag)
+    if got != want["digest"]:
+        try:
+            api_delete(tag)
+            msg = "removed it"
+        except Exception:
+            msg = "could NOT remove it - remove it by hand: ollama rm " + tag
+        raise Stop(f"{tag} digest {str(got)[:12]} != pinned {want['digest'][:12]} - {msg}; stopping")
+    done(m, s, digest=got)
+
+
+def st_privacy(m, sid, opts):
+    s = step(m, sid)
+    if sid == "privacy-apport":
+        path, want_fn = APPORT, lambda t: (re.sub(r"(?m)^enabled=.*$", "enabled=0", t) if re.search(r"(?m)^enabled=", t) else t.rstrip("\n") + "\nenabled=0\n")
+    elif sid == "privacy-popcon":
+        path, want_fn = POPCON, lambda t: (re.sub(r'(?m)^PARTICIPATE=.*$', 'PARTICIPATE="no"', t) if re.search(r"(?m)^PARTICIPATE=", t) else t.rstrip("\n") + '\nPARTICIPATE="no"\n')
+    else:
+        return st_ubuntu_report(m, sid, opts)
+    cur = file_state(path)
+    if not s:
+        if cur["type"] == "absent":
+            skipped(m, sid, "file", str(path), cur, "not installed here"); return
+        if cur["type"] != "file":
+            raise Stop(f"{path} is not a plain file - not touching it")
+        extra = {"unit_enabled": run(["systemctl", "is-enabled", "apport.service"], check=False).stdout.strip(),
+                 "unit_active": run(["systemctl", "is-active", "apport.service"], check=False).stdout.strip()} if sid == "privacy-apport" else {}
+        s = begin(m, sid, "file", str(path), {**cur, **extra})
+    pre = s["pre"]
+    target = want_fn(pre["content"]).encode("utf-8", "surrogateescape")
+    tsha = hashlib.sha256(target).hexdigest()
+    if (s.get("post") or {}).get("sha") != tsha:
+        s["post"] = {"sha": tsha}
+        save_manifest(m)
+    if cur.get("sha") not in (pre.get("sha"), tsha):
+        raise other_state(str(path))
+    if cur.get("sha") != tsha:
+        atomic_write(path, target, pre["mode"], pre["uid"], pre["gid"])
+    if sid == "privacy-apport" and s["pre"].get("unit_enabled") not in ("", "not-found", None):
+        run(["systemctl", "disable", "--now", "apport.service"])             # failure -> step stays INTENT (install stops)
+    done(m, s, sha=tsha)
+
+
+def st_ubuntu_report(m, sid, opts):
+    pw, s = invoking_user(), step(m, sid)
+    if not pw or not shutil.which("ubuntu-report"):
+        skipped(m, sid, "user-cmd", "ubuntu-report", {"type": "absent"}, "no desktop user or ubuntu-report not installed"); return
+    if s and s["state"] == "INTENT" and ur_optout_saved(pw, s["pre"]):
+        # interrupted after an opt-out answer appeared: do not send again - but we cannot PROVE we wrote it (you may have
+        # run ubuntu-report yourself), so undo will leave it in place ('adopted')
+        done(m, s, files=ur_listing(pw), adopted=True); return
+    s = s or begin(m, sid, "user-cmd", "ubuntu-report", {"uid": pw.pw_uid, "files": ur_listing(pw),
+                                                          "content": ur_contents(pw)})
+    r = as_user(pw, ["ubuntu-report", "-f", "send", "no"], check=False)
+    if r.returncode != 0:
+        # offline / server not reachable: ubuntu-report saves the answer and sends it later by itself - that is fine,
+        # as long as the 'no' answer really is saved on disk now
+        if not ur_optout_saved(pw, s["pre"]):
+            raise Stop(f"ubuntu-report could not record your answer ({r.stderr.strip()[:160]})")
+        say("  (Ubuntu's server was not reachable; ubuntu-report saved your 'no' and sends it later by itself)")
+    done(m, s, files=ur_listing(pw))
+
+
+def ur_optout_saved(pw, pre: dict) -> bool:
+    """True if some answer file that is new or changed since 'pre' now holds exactly ubuntu-report's opt-out answer."""
+    before = pre.get("files", {})
+    for f, h in ur_listing(pw).items():
+        if before.get(f) == h:
+            continue
+        r = as_user(pw, ["sh", "-c", 'cd ~/.cache/ubuntu-report && [ -f "$1" ] && [ ! -L "$1" ] && cat -- "$1"', "x", f],
+                    check=False)
+        try:
+            if r.returncode == 0 and json.loads(r.stdout) == {"OptOut": True}:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def ur_listing(pw) -> dict:
+    """ubuntu-report's per-user answer files (regular files only): name -> sha256."""
+    out = as_user(pw, ["sh", "-c", "cd ~/.cache/ubuntu-report 2>/dev/null && find . -maxdepth 1 -type f -exec sha256sum {} +"],
+                  check=False).stdout
+    return {l.split("  ", 1)[1]: l.split("  ", 1)[0] for l in out.splitlines() if "  " in l}
+
+
+def ur_contents(pw) -> dict:
+    """Full content (base64) of the existing answer files, so undo can put them back exactly (they are tiny)."""
+    out = {}
+    for name in ur_listing(pw):
+        r = as_user(pw, ["sh", "-c", 'cd ~/.cache/ubuntu-report && [ "$(stat -c %s -- "$1")" -le 262144 ] && base64 -w0 -- "$1"',
+                         "x", name], check=False)
+        if r.returncode != 0:
+            raise Stop(f"could not record your existing ubuntu-report file {name} - nothing changed")
+        out[name] = r.stdout.strip()
+    return out
+
+
+def gnome_session(pw) -> bool:
+    return run(["pgrep", "-u", str(pw.pw_uid), "-x", "gnome-shell"], check=False).returncode == 0
+
+
+def st_theme(m, sid, opts):
+    pw, s = invoking_user(), step(m, sid)
+    if not pw or not gnome_session(pw) or not Path(f"/run/user/{pw.pw_uid}/bus").exists():
+        skipped(m, sid, "gsettings", "background", {"type": "absent"}, "no running GNOME session for you")
+        say("  theme skipped (needs your running GNOME session: run install from your desktop with sudo)"); return
+    wall = Path(pw.pw_dir) / ".local/share/aurum-ws/aurum-wallpaper.png"
+    uri = wall.as_uri()
+    if not s:
+        pre = {"uid": pw.pw_uid}
+        for k in ("picture-uri", "picture-uri-dark"):
+            v = as_user(pw, ["dconf", "read", f"/org/gnome/desktop/background/{k}"], check=False).stdout.strip()
+            pre[k] = v if v else None                       # None = 'was default' -> undo resets
+        pre["wall_existed"] = as_user(pw, ["test", "-e", str(wall)], check=False).returncode == 0
+        if pre["wall_existed"]:
+            raise Stop(f"{wall} already exists - not touching it")
+        s = begin(m, sid, "gsettings", "org.gnome.desktop.background", pre,
+                  {"file": str(wall), "uri": uri, "sha": sha_nofollow(HERE / "assets/aurum-wallpaper.png")})
+    elif s["pre"]["uid"] != pw.pw_uid:
+        raise Stop("the theme step was started by another user - run install as that user")
+    else:                                                  # interrupted theme step: current values must be pre or ours
+        for k in ("picture-uri", "picture-uri-dark"):
+            cur = as_user(pw, ["dconf", "read", f"/org/gnome/desktop/background/{k}"], check=False).stdout.strip() or None
+            if cur not in (s["pre"].get(k), f"'{uri}'"):
+                raise other_state(f"the {k} setting")
+        r = as_user(pw, ["sh", "-c", '[ ! -e "$1" ] || { [ -f "$1" ] && [ ! -L "$1" ] && cmp -s -- "$1" "$2"; }', "x",
+                         str(wall), str(HERE / "assets/aurum-wallpaper.png")], check=False)
+        if r.returncode != 0:
+            raise other_state(str(wall))
+    # copy AS THE USER (root never follows a path the user controls)
+    # atomic: temp file in the same folder, flushed to disk, then renamed (a power cut never leaves a partial wallpaper)
+    as_user(pw, ["sh", "-c", 'mkdir -p -- "$(dirname -- "$2")" && t="$2.aurum-tmp" && rm -f -- "$t" && '
+                 'install -m 0644 -- "$1" "$t" && sync -- "$t" && mv -f -- "$t" "$2"', "x",
+                 str(HERE / "assets/aurum-wallpaper.png"), str(wall)])
+    wsha = as_user(pw, ["sha256sum", str(wall)]).stdout.split()[0]
+    for k in ("picture-uri", "picture-uri-dark"):
+        as_user(pw, ["gsettings", "set", "org.gnome.desktop.background", k, uri])
+    done(m, s, sha=wsha)
+
+
+STEPS = {"adopt-ollama": st_adopt, "ollama-files": st_files, "ollama-link": st_link, "ollama-user": st_user,
+         "models-dir": st_models_dir, "ollama-unit": st_unit, "model": st_model, "cli-link": st_cli,
+         "privacy": st_privacy, "theme": st_theme}
+
+
+# ---------- install / plan / status ----------
+def answer_test(m: dict) -> tuple[bool, str]:
+    usable = [s for s in m["steps"] if s["kind"] == "model" and (s["state"] == "DONE" or
+              (s["state"] == "SKIPPED" and s.get("note") == "your copy is used"))]
+    if not usable:
+        return False, "no tested model available (see the model line above)"
+    tag = usable[0]["resource"]
+    t0 = time.time()
+    try:
+        out = api("/api/generate", {"model": tag, "prompt": "Reply with the single word OK.", "stream": False,
+                                     "think": False, "options": {"num_predict": 32}}, timeout=ANSWER_S)
+        ps = api("/api/ps").get("models", [])
+    except Exception as exc:
+        return False, f"test answer from {tag} failed ({type(exc).__name__}) after {time.time() - t0:.0f} s"
+    ans = (out.get("response") or "").strip()
+    if not ans:
+        return False, f"test answer from {tag} was empty after {time.time() - t0:.0f} s"
+    vram = sum(x.get("size_vram", 0) for x in ps if x.get("name") == tag or x.get("model") == tag)
+    return True, (f"test answer from {tag}: {ans[:40]!r} in {time.time() - t0:.0f} s - runs on: "
+                  f"{'GPU (' + str(round(vram / 1e9, 1)) + ' GB in VRAM)' if vram else 'CPU'}")
+
+
+def do_install(opts) -> int:
+    check_host()
+    with Locked():
+        m = load_manifest()
+        if m and m["state"] == "UNDOING":
+            raise Stop("an undo was interrupted - finish it first: sudo aurum-ws undo")
+        if m is None:
+            pw = invoking_user()
+            m = {"id": hashlib.sha256(os.urandom(16)).hexdigest()[:16], "version": REL["aurum_ws"], "state": "INSTALLING",
+                 "steps": [], "opts": opts, "user": pw.pw_name if pw else None, "started": time.time(),
+                 "stage_inventory": tree_inventory(HERE)}
+            save_manifest(m)
+        opts = m.get("opts", opts)
+        m["state"] = "INSTALLING"
+        save_manifest(m)
+        for sid, what in install_steps(opts, m):
+            s = step(m, sid)
+            if s and s["state"] in ("DONE", "SKIPPED"):
+                continue
+            say(f"- {what}")
+            STEPS[sid.split("-")[0] if sid.startswith(("model-", "privacy-", "theme-")) else sid](m, sid, opts)
+        ok, line = answer_test(m)
+        m["state"] = "INSTALLED" if ok else "INSTALLED_WITH_PROBLEM"
+        save_manifest(m)
+    say("")
+    show_steps(m)
+    say(("OK - " if ok else "PROBLEM - ") + line)
+    if not ok:
+        say("Everything Aurum did is recorded; fix the problem and run install again, or undo it: sudo aurum-ws undo")
+    return 0 if ok else 1
+
+
+def show_steps(m: dict) -> None:
+    say(f"Aurum Workstation {m['version']}: {m['state']}")
+    for s in m["steps"]:
+        say(f"  {s['state']:<11} {s['id']}" + (f"  ({s['note']})" if s.get("note") else ""))
+
+
+def do_plan(opts) -> int:
+    osr = check_host()
+    say(f"Ubuntu {osr['VERSION_ID']} x86_64 - RAM {ram_gb()} GB - free disk {free_gb(OLLAMA_DIR):.0f} GB - GPU detected: "
+        f"{', '.join(gpus()) or 'none'} (v1 installs no drivers; GPU use is reported after the test answer)")
+    m = load_manifest()
+    if m:
+        say(f"Existing Aurum record: state {m['state']}.")
+    say("Install would do (nothing is changed by 'plan'):")
+    for sid, what in install_steps(opts, m):
+        s = step(m, sid)
+        say(f"  [{'done' if s and s['state'] in ('DONE', 'SKIPPED') else 'todo'}] {what}")
+    return 0
+
+
+def do_status(opts) -> int:
+    m = load_manifest()
+    if not m:
+        say("Aurum Workstation is not installed (no record)."); return 0
+    show_steps(m)
+    ok, line = answer_test(m)
+    say(("OK - " if ok else "PROBLEM - ") + line)
+    return 0 if ok else 1
+
+
+# ---------- undo ----------
+def undo_step(s: dict, opts, m: dict) -> str:
+    kind, res, post, pre = s["kind"], s["resource"], s.get("post") or {}, s.get("pre") or {}
+    if s["state"] == "INTENT":                               # interrupted step: undo only what is provably ours
+        if kind in ("link",) and Path(res).is_symlink() and os.readlink(res) == post.get("target"):
+            pass
+        elif kind == "unit" and sha_nofollow(Path(res)) == post.get("sha"):
+            pass
+        elif kind == "dir" and res == str(ollama_dest()) and sha_nofollow(Path(res) / OWN_MARK) is not None and \
+                (Path(res) / OWN_MARK).read_text().strip() == m["id"]:
+            post = {**post, "inventory": tree_inventory(Path(res))}
+        elif kind in ("model", "user", "user-cmd", "gsettings", "file") or (kind == "dir" and res == str(MODELS_DIR)):
+            pass                                             # handled with their own checks below
+        else:
+            return "nothing to undo (the step had not changed anything Aurum can prove)"
+    if s["id"] == "ollama-user":
+        return Kept("kept (other services may use the 'ollama' account) - remove by hand: sudo userdel ollama")
+    if kind == "model":
+        if not opts.get("purge_models"):
+            return Kept("model kept (use --purge-models to remove it)")
+        with temporary_ollama(m) as ours:
+            if not ours:
+                return Kept("kept: the Ollama answering now is not Aurum's (its service is gone) - Aurum does not touch "
+                            "another Ollama's models; remove it there yourself if you want: ollama rm " + res)
+            try:
+                cur = tags().get(res)
+            except Exception:
+                raise Stop("Ollama is not running - start it (sudo systemctl start ollama) and run undo again")
+            if cur is None:
+                return "already gone"
+            if cur != post.get("digest"):
+                return Kept("kept: you updated this model since Aurum pulled it")
+            api_delete(res)
+            return "removed"
+    if kind == "unit":
+        # a service you changed is kept - and then undo must STOP here, because older steps (the ollama program and its
+        # files) are what that service runs; removing them would break it at the next restart
+        if (Path(res).is_symlink() or (Path(res).exists() and not Path(res).is_file())) and not opts.get("force"):
+            raise Stop("ollama.service was replaced (it is now a link or not a plain file) - kept; undo stops here "
+                       "(put Aurum's file back or remove it, or add --force)")
+        if sha_nofollow(Path(res)) not in (post.get("sha"), None) and not opts.get("force"):
+            raise Stop("ollama.service was edited after install - kept and running; undo stops here so it keeps "
+                       "working (undo your edit, or add --force to remove it anyway)")
+        dropins = run(["systemctl", "show", "-p", "DropInPaths", "--value", "ollama.service"], check=False).stdout.strip()
+        if dropins and not opts.get("force"):
+            raise Stop(f"ollama.service has add-on settings made after install ({dropins}) - kept and running; undo "
+                       "stops here so it keeps working (remove them, or add --force to remove the service anyway)")
+        run(["systemctl", "disable", "--now", "ollama.service"])            # raises -> UNDO_FAILED (never 'removed' when it failed)
+        if run(["systemctl", "is-active", "ollama.service"], check=False).stdout.strip() == "active":
+            raise Stop("ollama.service did not stop")
+        Path(res).unlink(missing_ok=True)
+        run(["systemctl", "daemon-reload"])
+        return "stopped and removed"
+    if kind == "dir" and res == str(MODELS_DIR):
+        if opts.get("purge_models"):
+            if MODELS_DIR.is_symlink():
+                return Kept("kept (not a real folder any more)")
+            for d, subdirs, files in os.walk(MODELS_DIR, topdown=False):   # only EMPTY folders (Ollama leaves blobs/,
+                if not files:                                                # manifests/...); any file -> kept
+                    try:
+                        os.rmdir(d)
+                    except OSError:
+                        pass
+            if not MODELS_DIR.exists():
+                return "removed (no models left in it)"
+            left = sorted(str(f.relative_to(MODELS_DIR)) for f in MODELS_DIR.rglob("*") if not f.is_dir())
+            return Kept(f"kept: still contains {len(left)} file(s), e.g. {', '.join(left[:3])} - remove it by hand if "
+                        f"you do not need them: sudo rm -r {MODELS_DIR}")
+        return Kept("kept (models are kept by default)")
+    if kind == "dir":
+        p = Path(res)
+        if not p.exists():
+            return "already gone"
+        unchanged = post.get("inventory") is not None and tree_inventory(p) == post["inventory"]
+        if not unchanged and not opts.get("force"):
+            return "kept: files were added/changed/removed after install (--force removes it)"
+        shutil.rmtree(p)
+        return "removed"
+    if kind == "link":
+        p = Path(res)
+        if p.is_symlink() and os.readlink(p) == post.get("target"):
+            p.unlink()
+            return "removed"
+        if not p.exists() and not p.is_symlink():
+            return "already gone"
+        if p in (OLLAMA_LINK, CLI_LINK) and not opts.get("force"):
+            raise Stop(f"{p} was changed after install - kept; undo stops here because it may still use Aurum's "
+                       "files (put it back or remove it, or add --force to remove Aurum's files anyway)")
+        return Kept("kept (not Aurum's link any more)")
+    if kind == "file":
+        p, cur = Path(res), file_state(Path(res))
+        if cur.get("sha") == pre.get("sha"):
+            msg = "already as before"
+        elif cur.get("sha") != post.get("sha") and not opts.get("force"):
+            msg = "file kept (you changed it after install; --force restores it)"   # service state still restored below
+        else:
+            atomic_write(p, pre["content"].encode("utf-8", "surrogateescape"), pre["mode"], pre["uid"], pre["gid"])
+            msg = "restored"
+        if pre.get("unit_enabled") == "enabled":                            # every run (resumable); failure -> UNDO_FAILED
+            run(["systemctl", "enable", "apport.service"])
+        if pre.get("unit_active") == "active":
+            run(["systemctl", "start", "apport.service"])
+        return msg
+    if kind == "user-cmd":
+        pw = invoking_user()
+        if not pw or pw.pw_uid != pre.get("uid"):
+            raise Stop("run undo with sudo from the same user who installed (ubuntu-report is per user)")
+        cur, before, after = ur_listing(pw), pre.get("files", {}), post.get("files")   # after=None: interrupted step
+        kept, saved = [], []
+        for f, h in before.items():                        # files that existed: put back exactly what was there
+            if cur.get(f) == h:
+                continue
+            if after is not None and cur.get(f) not in (after.get(f), None) and not opts.get("force"):
+                kept.append(f); continue                   # you changed it after install
+            if (after is None or post.get("adopted") or f not in cur) and not opts.get("force"):
+                # after an interruption we cannot prove who changed (or deleted) it: leave the current state AND put
+                # your earlier answer next to it - verified, never over an existing file
+                side = f + ".before-aurum"
+                r = as_user(pw, ["sh", "-c", 'mkdir -p ~/.cache/ubuntu-report && cd ~/.cache/ubuntu-report && umask 077 && '
+                                 '[ ! -e "$1" ] && [ ! -L "$1" ] && base64 -d > "$1"', "x", side],
+                            input=pre["content"][f], check=False)
+                if r.returncode != 0 or ur_listing(pw).get(side) != h:
+                    raise Stop(f"could not save your earlier ubuntu-report answer as ~/.cache/ubuntu-report/"
+                               f"{side.lstrip('./')} (does it exist already?) - nothing was changed; move it away, then undo again")
+                saved.append(f"~/.cache/ubuntu-report/{f.lstrip('./')} as it is now (your earlier answer: "
+                             f"{side.lstrip('./')} - to use it again: mv ~/.cache/ubuntu-report/{side.lstrip('./')} "
+                             f"~/.cache/ubuntu-report/{f.lstrip('./')})")
+                continue
+            as_user(pw, ["sh", "-c", 'mkdir -p ~/.cache/ubuntu-report && cd ~/.cache/ubuntu-report && umask 077 && '
+                         'base64 -d > "$1.aurum-tmp" && mv -f -- "$1.aurum-tmp" "$1"', "x", f],
+                    input=pre["content"][f])
+            if ur_listing(pw).get(f) != h:
+                raise Stop(f"could not restore your ubuntu-report file {f}")
+        for f, h in cur.items():                           # files that did not exist: remove Aurum's answer
+            if f in before:
+                continue
+            if after is not None and after.get(f) != h and not opts.get("force"):
+                kept.append(f); continue
+            if (after is None or post.get("adopted")) and not opts.get("force"):
+                kept.append(f); continue                   # not provably Aurum's (interrupted step)
+            as_user(pw, ["sh", "-c", 'cd ~/.cache/ubuntu-report && [ -f "$1" ] && [ ! -L "$1" ] && rm -f -- "$1"', "x", f])
+        return "restored (your previous ubuntu-report answer is back)" + (f"; kept {'; '.join(saved)}" if saved else "") + (
+            f"; kept (Aurum cannot prove it wrote them after an interruption, or you changed them - delete by hand if "
+            f"you want): {', '.join('~/.cache/ubuntu-report/' + k.lstrip('./') for k in kept)}" if kept else "")
+    if kind == "gsettings":
+        pw = invoking_user()
+        if not pw or pw.pw_uid != pre.get("uid"):
+            raise Stop("run undo with sudo from the same desktop user who installed the theme")
+        if not Path(f"/run/user/{pw.pw_uid}/bus").exists():
+            raise Stop("the wallpaper setting can only be restored from your running desktop session - run undo there")
+        for k in ("picture-uri", "picture-uri-dark"):
+            cur = as_user(pw, ["dconf", "read", f"/org/gnome/desktop/background/{k}"]).stdout.strip()
+            if cur != f"'{post.get('uri')}'":
+                continue                                    # you changed or reset it since: left as you set it
+            if pre.get(k) is None:
+                as_user(pw, ["gsettings", "reset", "org.gnome.desktop.background", k])     # raises -> UNDO_FAILED
+            else:
+                as_user(pw, ["dconf", "write", f"/org/gnome/desktop/background/{k}", pre[k]])
+            if as_user(pw, ["dconf", "read", f"/org/gnome/desktop/background/{k}"]).stdout.strip() == f"'{post.get('uri')}'":
+                raise Stop(f"the {k} setting could not be restored (locked?)")
+        as_user(pw, ["sh", "-c", 't="$1.aurum-tmp"; [ -f "$t" ] && [ ! -L "$t" ] && rm -f -- "$t"; true', "x",
+                     post.get("file", "/nonexistent")], check=False)             # Aurum's own unfinished copy, if any
+        r = as_user(pw, ["sh", "-c", '[ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %u -- "$1")" = "$3" ] && '
+                         '[ "$(sha256sum -- "$1" | cut -d" " -f1)" = "$2" ] && rm -f -- "$1"', "x",
+                         post.get("file", "/nonexistent"), post.get("sha", "-"), str(pw.pw_uid)], check=False)
+        return "restored" + ("" if r.returncode == 0 else " (the wallpaper file was changed or replaced - left in place)")
+    return "nothing to do"
+
+
+def remove_own_partials(m: dict) -> list[str]:
+    """Unfinished unpack folders that carry THIS record's mark (written first). Errors are raised, not hidden."""
+    notes = []
+    for old in OLLAMA_DIR.glob(f".ollama-{REL['ollama']['version']}.partial*"):
+        if old.is_symlink() or not old.is_dir():
+            continue
+        try:
+            mine = (old / OWN_MARK).read_text().strip() == m["id"]
+        except OSError:
+            mine = False
+        if mine:
+            shutil.rmtree(old)                                  # raises -> step / undo fails visibly
+            notes.append(f"removed unfinished unpack {old.name}")
+    return notes
+
+
+def aurum_service_answers() -> bool:
+    """True only if 127.0.0.1:11434 is served by Aurum's ollama.service right now: active, no add-on settings (they could
+    point it at another model folder), and the listening process belongs to the service's own control group."""
+    show = run(["systemctl", "show", "-p", "ActiveState,DropInPaths,ControlGroup", "ollama.service"], check=False).stdout
+    kv = dict(l.split("=", 1) for l in show.splitlines() if "=" in l)
+    if kv.get("ActiveState") != "active" or kv.get("DropInPaths") or not kv.get("ControlGroup"):
+        return False
+    ss = run(["ss", "-H", "-ltnp", "sport = :11434"], check=False).stdout
+    pids = set(re.findall(r"pid=(\d+)", ss))
+    if not pids:
+        return False
+    for pid in pids:
+        try:
+            cg = Path(f"/proc/{pid}/cgroup").read_text()
+        except OSError:
+            return False
+        if not any(line.endswith(":" + kv["ControlGroup"]) for line in cg.splitlines()):
+            return False
+    return True
+
+
+@contextlib.contextmanager
+def temporary_ollama(m: dict):
+    """If the service is already gone (an earlier undo stopped later) but Aurum's own, unchanged Ollama files are still
+    there, run them briefly - localhost only, as the 'ollama' user - so a model can still be removed. Otherwise no-op."""
+    try:
+        api("/api/version", timeout=3)
+        running = True
+    except Exception:
+        running = False
+    unit = step(m, "ollama-unit")
+    if running:                                          # yield OUTSIDE the try: errors in the body must propagate
+        # whoever answers is Aurum's only while Aurum's service is still installed and unchanged
+        yield bool(unit and unit["state"] not in ("UNDONE",) and sha_nofollow(UNIT) == (unit.get("post") or {}).get("sha")
+                   and aurum_service_answers())
+        return
+    models_real = all(p.is_dir() and not p.is_symlink() for p in (MODELS_DIR, MODELS_DIR / "models"))
+    if (unit and unit["state"] not in ("UNDONE",) and sha_nofollow(UNIT) == (unit.get("post") or {}).get("sha")
+            and models_real and not run(["systemctl", "show", "-p", "DropInPaths", "--value", "ollama.service"],
+                                        check=False).stdout.strip()):
+        # Aurum's own, unchanged service is just stopped: start it for the purge (the unit step stops it again later)
+        run(["systemctl", "start", "ollama.service"])     # failure -> UNDO_FAILED (record kept, retry possible)
+        wait_api(60, REL["ollama"]["version"])
+        yield aurum_service_answers()
+        return
+    files = step(m, "ollama-files")
+    exe = ollama_dest() / "bin/ollama"
+    if (UNIT.exists() or not models_real or not files or files["state"] not in ("DONE", "INTENT") or port_busy()
+            or tree_inventory(ollama_dest()) != (files.get("post") or {}).get("inventory")):
+        yield False
+        return
+    p = subprocess.Popen(["runuser", "-u", "ollama", "--", "env", "OLLAMA_HOST=127.0.0.1:11434",
+                          f"OLLAMA_MODELS={MODELS_DIR / 'models'}", f"HOME={MODELS_DIR}", str(exe), "serve"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=_die_with_parent)
+    try:
+        wait_api(30, REL["ollama"]["version"])
+        yield True
+    finally:
+        p.terminate()
+        try:
+            p.wait(15)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+def cleanup_leftovers(m: dict) -> list[str]:
+    """Remove only what Aurum provably left: its per-install download folder, partial dirs carrying this record's
+    mark. Raises on errors (undo stays resumable)."""
+    notes = remove_own_partials(m)
+    cache = cache_dir(m)
+    if cache.is_symlink():
+        raise Stop(f"{cache} was replaced by a link - remove it by hand")
+    if cache.exists():
+        known = {f"ollama-{REL['ollama']['version']}.tar.zst"}
+        for f in cache.iterdir():
+            if (f.name in known or f.name.startswith(".download.")) and not f.is_symlink() and f.is_file():
+                f.unlink()
+        try:
+            cache.rmdir()
+        except OSError:
+            notes.append(f"kept {cache} (contains files Aurum did not put there)")
+    return notes
+
+
+def finish_stage(m: dict, archive: Path) -> str:
+    """Phase 1: remove the staged copy except this script; record UNDONE; phase 2: remove the script + folders. A power
+    cut between the phases leaves only the script, which (run again) finishes phase 2 - see remove_last_script()."""
+    note = remove_stage(m)
+    m["state"] = "UNDONE"
+    m["stage_note"] = note
+    atomic_write(archive, json.dumps(m, indent=1, sort_keys=True).encode())
+    if note == "removed":
+        kill_point("undo", "stage-phase1")
+        remove_last_script()
+    return note
+
+
+LAST_FILES = {"aurum-ws", "release.json"}                   # what the script needs to run again (it reads release.json)
+
+
+def remove_last_script() -> None:
+    if str(HERE).startswith(str(STAGE) + "/") and HERE.is_dir() and set(os.listdir(HERE)) <= LAST_FILES:
+        for name in sorted(LAST_FILES, reverse=True):       # release.json, then the script itself
+            (HERE / name).unlink(missing_ok=True)
+            if name == "release.json":
+                kill_point("undo", "last-files")             # only the script is left: a rerun still finishes
+        HERE.rmdir()
+        try:
+            STAGE.rmdir()
+        except OSError:
+            pass
+
+
+def remove_stage(m: dict) -> str:
+    """The staged copy is removed only if it is exactly what was staged when install started."""
+    if m.get("keep_stage"):
+        return f"kept {HERE} (your changed {CLI_LINK} may still use it - remove both by hand if you want)"
+    if not str(HERE).startswith(str(STAGE) + "/"):
+        return "not under the stage folder - left"
+    inv, rec = tree_inventory(HERE), m.get("stage_inventory")
+    # unchanged, or PART of it already removed by an interrupted earlier undo (missing entries only - nothing new,
+    # nothing changed): both are provably the staged copy
+    if rec is None or any(rec.get(k) != v for k, v in inv.items()):
+        return f"kept {HERE} (changed since install - remove it by hand if you want)"
+    try:
+        for f in HERE.iterdir():                             # everything except what a rerun needs (phase 2 removes it)
+            if f.name in LAST_FILES:
+                continue
+            if f.is_dir() and not f.is_symlink():
+                shutil.rmtree(f)
+            else:
+                f.unlink()
+            kill_point("undo", "stage-mid")                     # power cut half-way through the staged copy
+    except OSError as exc:
+        return f"kept {HERE} (could not remove it: {exc.strerror}) - remove it by hand"
+    others = [q for q in STAGE.iterdir() if q != HERE]
+    return "removed" if not others else f"removed {HERE.name}; kept {STAGE} (other files in it)"
+
+
+def do_undo(opts) -> int:
+    if os.geteuid() != 0 and not TEST_BUILD:
+        raise Stop("run with sudo")
+    with Locked():
+        m = load_manifest()
+        if not m:
+            pending = sorted(STATE.glob("manifest-undone-*.json"))
+            last = json.loads(pending[-1].read_text()) if pending else None
+            if last and last.get("state") == "UNDONE_STAGE_PENDING":   # an undo stopped just before removing the stage
+                say(f"  stage: {finish_stage(last, pending[-1])}")
+                say("Undo complete (finished the interrupted last step).")
+                return 0
+            if last and last.get("state") == "UNDONE" and HERE.is_dir() and set(os.listdir(HERE)) <= LAST_FILES:
+                remove_last_script()                                    # power cut between the two stage phases
+                say("Undo complete (removed the last staged file).")
+                return 0
+            raise Stop("no Aurum record (nothing installed by Aurum, or already undone)")
+        m["state"] = "UNDOING"
+        save_manifest(m)
+        for s in reversed(m["steps"]):
+            if s["id"] == "cli-link" or s["state"] in ("UNDONE", "SKIPPED"):
+                continue
+            try:
+                msg = undo_step(s, opts, m)
+                s["state"] = "KEPT" if isinstance(msg, Kept) else "UNDONE"
+            except Exception as exc:
+                s["state"] = "UNDO_FAILED"
+                msg = f"FAILED ({exc if isinstance(exc, Stop) else type(exc).__name__}) - fix it, then run undo again"
+            s["undo_note"] = msg
+            save_manifest(m)
+            say(f"  {s['id']}: {msg}")
+            if s["state"] == "UNDO_FAILED":                  # strict reverse order: older steps stay until this one is undone
+                raise Stop(f"undo stopped at {s['id']} - nothing older was touched; fix it, then run again: "
+                           f"sudo {HERE / 'aurum-ws'} undo")
+        cli = step(m, "cli-link")                            # final order: link, leftovers, archive (stage pending), stage
+        if cli and cli["state"] != "UNDONE":
+            msg = undo_step(cli, opts, m)
+            say(f"  cli-link: {msg}")
+            cli["state"] = "KEPT" if isinstance(msg, Kept) else "UNDONE"
+            m["keep_stage"] = isinstance(msg, Kept)                 # your changed link may point into the stage
+            save_manifest(m)
+        kill_point("undo", "cli-link")
+        for note in cleanup_leftovers(m):
+            say(f"  {note}")
+        kill_point("undo", "leftovers")
+        m["state"] = "UNDONE_STAGE_PENDING"
+        archive = STATE / f"manifest-undone-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
+        atomic_write(archive, json.dumps(m, indent=1, sort_keys=True).encode())
+        MANIFEST.unlink()
+        kill_point("undo", "archived")
+        say(f"  stage: {finish_stage(m, archive)}")
+        say("Undo complete. Kept on purpose: the 'ollama' system account" +
+            ("" if opts.get("purge_models") else ", your models in /var/lib/ollama") +
+            ", /var/lib/aurum-ws/incoming (your verified downloads) and the undo record.")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="aurum-ws", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("plan", "install"):
+        p = sub.add_parser(name)
+        p.add_argument("--privacy", action="store_true")
+        p.add_argument("--theme", action="store_true")
+        p.add_argument("--model", choices=[x["tag"] for x in REL["models"]])
+    sub.add_parser("status")
+    u = sub.add_parser("undo")
+    u.add_argument("--purge-models", action="store_true")
+    u.add_argument("--force", action="store_true")
+    a = ap.parse_args(argv)
+    opts = {k: v for k, v in vars(a).items() if k != "cmd"}
+    try:
+        if a.cmd in ("plan", "install") and opts.get("theme") and not invoking_user():
+            raise Stop("--theme needs sudo from your own desktop user (not a root login)")
+        return {"plan": do_plan, "install": do_install, "status": do_status, "undo": do_undo}[a.cmd](opts)
+    except Stop as e:
+        say(f"STOPPED: {e}")
+        return 1
+    except Exception as e:                                   # never a bare traceback; the record stays consistent
+        say(f"STOPPED: unexpected error ({type(e).__name__}: {str(e)[:200]}). Everything done so far is recorded: "
+            "run the same command again, or undo.")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

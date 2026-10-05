@@ -1,0 +1,39 @@
+{
+ "aurum_ws": "1.0.0-preview",
+ "ollama": {
+  "version": "0.35.1",
+  "url": "https://github.com/ollama/ollama/releases/download/v0.35.1/ollama-linux-amd64.tar.zst",
+  "sha256": "9fcd79ac4575b2bd31b992eee18b1000c8ad126b451627c8f8cd091714cfbb10",
+  "size": 1439658961
+ },
+ "models": [
+  {
+   "min_ram_gb": 0,
+   "tag": "qwen3:1.7b",
+   "digest": "8f68893c685c3ddff2aa3fffce2aa60a30bb2da65ca488b61fff134a4d1730e7",
+   "size": 1359292957
+  },
+  {
+   "min_ram_gb": 8,
+   "tag": "qwen3:4b",
+   "digest": "359d7dd4bcdab3d86b87d73ac27966f4dbb9f5efdfcc75d34a8764a09474fae7",
+   "size": 2497293444
+  },
+  {
+   "min_ram_gb": 16,
+   "tag": "qwen3:8b",
+   "digest": "500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41",
+   "size": 5225387677
+  },
+  {
+   "min_ram_gb": 32,
+   "tag": "qwen3:14b",
+   "digest": "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8",
+   "size": 9276198077
+  }
+ ],
+ "ubuntu": [
+  "24.04",
+  "26.04"
+ ]
+}
