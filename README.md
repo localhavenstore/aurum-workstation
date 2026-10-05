@@ -1,4 +1,4 @@
-# Aurum Workstation (free, v1.0 preview)
+# Aurum Workstation (free, v1.0.1 preview)
 
 Local AI on the Ubuntu you already have - with a full record of what was changed and an undo.
 
@@ -22,7 +22,7 @@ wallpaper step is skipped). Not supported: other Ubuntu versions, other distribu
   | RAM | model | download |
   |---|---|---|
   | under 8 GB | qwen3:1.7b | 1.4 GB |
-  | 8-15 GB | qwen3:4b | 2.5 GB |
+  | 8-15 GB | qwen3:4b-instruct | 2.5 GB |
   | 16-31 GB | qwen3:8b | 5.2 GB |
   | 32 GB or more | qwen3:14b | 9.3 GB |
 
@@ -40,21 +40,21 @@ wallpaper step is skipped). Not supported: other Ubuntu versions, other distribu
 
 ## Install
 1. Tools (from Ubuntu's own archive): `sudo apt install curl zstd minisign`
-2. Download from the GitHub release: `aurum-ws-1.0.0-preview.tar.gz`, `SHA256SUMS`, `SHA256SUMS.minisig`.
+2. Download from the GitHub release: `aurum-ws-1.0.1.tar.gz`, `SHA256SUMS`, `SHA256SUMS.minisig`.
 3. Copy them as root into a root-only folder FIRST, then verify and unpack only those copies:
    ```
    sudo install -d -m 0700 /var/lib/aurum-ws/incoming
-   sudo install -m 0600 aurum-ws-1.0.0-preview.tar.gz SHA256SUMS SHA256SUMS.minisig /var/lib/aurum-ws/incoming/
+   sudo install -m 0600 aurum-ws-1.0.1.tar.gz SHA256SUMS SHA256SUMS.minisig /var/lib/aurum-ws/incoming/
    sudo sh -c 'cd /var/lib/aurum-ws/incoming && minisign -Vm SHA256SUMS -P RWRm811iTQFRJDr+KMkiTDBv0FiIz9owb6TzcHOD1qZrohmHulCk8m6I && sha256sum -c SHA256SUMS \
-     && install -d -m 0755 /var/lib/aurum-ws/stage && tar -xzf aurum-ws-1.0.0-preview.tar.gz -C /var/lib/aurum-ws/stage --no-same-owner'
+     && install -d -m 0755 /var/lib/aurum-ws/stage && tar -xzf aurum-ws-1.0.1.tar.gz -C /var/lib/aurum-ws/stage --no-same-owner'
    ```
    Release public key (key ID 2451014D625DF366):
    ```
    RWRm811iTQFRJDr+KMkiTDBv0FiIz9owb6TzcHOD1qZrohmHulCk8m6I
    ```
    It is printed here AND on https://localhavenstore.github.io (two places, so one hacked page is not enough).
-4. See what would happen (changes nothing): `sudo /var/lib/aurum-ws/stage/aurum-ws-1.0.0-preview/aurum-ws plan`
-5. Install: `sudo /var/lib/aurum-ws/stage/aurum-ws-1.0.0-preview/aurum-ws install` (add `--privacy`, `--theme`, `--model TAG`)
+4. See what would happen (changes nothing): `sudo /var/lib/aurum-ws/stage/aurum-ws-1.0.1/aurum-ws plan`
+5. Install: `sudo /var/lib/aurum-ws/stage/aurum-ws-1.0.1/aurum-ws install` (add `--privacy`, `--theme`, `--model TAG`)
 6. Check any time: `sudo aurum-ws status` (shows every step and a test answer).
 
 If an install is interrupted (power cut, Ctrl+C), run the same install command again - it continues.
@@ -69,7 +69,14 @@ If an install is interrupted (power cut, Ctrl+C), run the same install command a
   (edited it or added your own settings), undo stops at that step and leaves Ollama fully working - nothing older is
   removed - until you undo your change or add `--force`;
 - `/var/lib/aurum-ws/incoming` (your verified downloads) and the record of the undo.
-If undo is interrupted before it finishes: `sudo /var/lib/aurum-ws/stage/aurum-ws-1.0.0-preview/aurum-ws undo`.
+If undo is interrupted before it finishes: `sudo /var/lib/aurum-ws/stage/aurum-ws-1.0.1/aurum-ws undo`.
+
+## Upgrading from 1.0.0-preview
+1.0.1 changes the model for 8-15 GB of RAM to `qwen3:4b-instruct`: the `qwen3:4b` that 1.0.0-preview pinned is a
+"thinking" model that writes a long reasoning text before every answer. If you installed 1.0.0-preview you can keep it
+and just run `ollama pull qwen3:4b-instruct`, or undo it with its own copy
+(`sudo /var/lib/aurum-ws/stage/aurum-ws-1.0.0-preview/aurum-ws undo`) and install 1.0.1. 1.0.1 never changes a
+system recorded by another version - it stops and tells you this.
 
 ## Known limits (v1.0 preview)
 Undo is built to never remove what it cannot prove is Aurum's, and to stop rather than guess. So if you hand-edit
@@ -78,7 +85,7 @@ in `/var/lib/aurum-ws`) between install and undo, undo may stop at that step and
 `--force`, or keep a file and tell you where it is. It never silently deletes your own files. If anything is unclear:
 `sudo aurum-ws status` shows every step, and the record is plain JSON in `/var/lib/aurum-ws/manifest.json`.
 Power loss DURING undo may leave some of Aurum's files behind: just run undo again (`sudo aurum-ws undo`, or the
-staged copy `sudo /var/lib/aurum-ws/stage/aurum-ws-1.0.0-preview/aurum-ws undo`) - it continues where it stopped.
+staged copy `sudo /var/lib/aurum-ws/stage/aurum-ws-1.0.1/aurum-ws undo`) - it continues where it stopped.
 
 ## Tested
 On fresh throwaway VMs (official Ubuntu cloud images; 4 CPU cores, 8 GB RAM, no GPU; server images, so no desktop),

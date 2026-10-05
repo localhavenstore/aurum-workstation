@@ -1,5 +1,5 @@
 {
- "aurum_ws": "1.0.0-preview",
+ "aurum_ws": "1.0.1",
  "ollama": {
   "version": "0.35.1",
   "url": "https://github.com/ollama/ollama/releases/download/v0.35.1/ollama-linux-amd64.tar.zst",
@@ -15,9 +15,9 @@
   },
   {
    "min_ram_gb": 8,
-   "tag": "qwen3:4b",
-   "digest": "359d7dd4bcdab3d86b87d73ac27966f4dbb9f5efdfcc75d34a8764a09474fae7",
-   "size": 2497293444
+   "tag": "qwen3:4b-instruct",
+   "digest": "0edcdef34593eac1aa2be9c7d06c432dcf81945adca5eca2f27662c18f168ba0",
+   "size": 2497293316
   },
   {
    "min_ram_gb": 16,

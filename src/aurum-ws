@@ -392,7 +392,16 @@ def api(path: str, body=None, timeout=30, method=None):
 
 
 def tags() -> dict:
-    return {m["name"]: m["digest"] for m in api("/api/tags").get("models", [])}
+    """1.0.1: Ollama can be slow to answer right after a big pull or a fresh start - wait longer, retry, then stop
+    with a clear message (1.0.0 ended with 'unexpected error (TimeoutError)' on a real fresh VM)."""
+    for i in range(3):
+        try:
+            return {m["name"]: m["digest"] for m in api("/api/tags", timeout=120).get("models", [])}
+        except (TimeoutError, OSError) as exc:
+            last = exc
+            time.sleep(5)
+    raise Stop(f"Ollama did not list its models in time ({type(last).__name__}) - wait a minute, then run the same "
+               "command again (everything done so far is recorded)")
 
 
 def api_delete(tag: str) -> None:
@@ -823,12 +832,21 @@ def answer_test(m: dict) -> tuple[bool, str]:
         ps = api("/api/ps").get("models", [])
     except Exception as exc:
         return False, f"test answer from {tag} failed ({type(exc).__name__}) after {time.time() - t0:.0f} s"
-    ans = (out.get("response") or "").strip()
+    ans = re.sub(r"(?s)^\s*<think>.*?(</think>|$)", "", out.get("response") or "").strip()   # 1.0.1: never show thinking text
     if not ans:
         return False, f"test answer from {tag} was empty after {time.time() - t0:.0f} s"
     vram = sum(x.get("size_vram", 0) for x in ps if x.get("name") == tag or x.get("model") == tag)
     return True, (f"test answer from {tag}: {ans[:40]!r} in {time.time() - t0:.0f} s - runs on: "
                   f"{'GPU (' + str(round(vram / 1e9, 1)) + ' GB in VRAM)' if vram else 'CPU'}")
+
+
+def same_version(m: dict) -> None:
+    """1.0.1: one record = one Aurum version. Another version's record is handled only by that version's own copy."""
+    v = m.get("version")
+    if v != REL["aurum_ws"]:
+        raise Stop(f"this system was set up by Aurum Workstation {v}. Use that version's copy for it: "
+                   f"sudo /var/lib/aurum-ws/stage/aurum-ws-{v}/aurum-ws undo  (or keep it). "
+                   f"Then run this {REL['aurum_ws']} install again. Nothing was changed.")
 
 
 def do_install(opts) -> int:
@@ -837,6 +855,8 @@ def do_install(opts) -> int:
         m = load_manifest()
         if m and m["state"] == "UNDOING":
             raise Stop("an undo was interrupted - finish it first: sudo aurum-ws undo")
+        if m is not None:
+            same_version(m)
         if m is None:
             pw = invoking_user()
             m = {"id": hashlib.sha256(os.urandom(16)).hexdigest()[:16], "version": REL["aurum_ws"], "state": "INSTALLING",
@@ -1234,6 +1254,7 @@ def do_undo(opts) -> int:
                 say("Undo complete (removed the last staged file).")
                 return 0
             raise Stop("no Aurum record (nothing installed by Aurum, or already undone)")
+        same_version(m)
         m["state"] = "UNDOING"
         save_manifest(m)
         for s in reversed(m["steps"]):
