@@ -112,3 +112,10 @@ upgrading from one Aurum version to the next.
 
 ## Licence
 MIT. Not affiliated with Ollama, Canonical/Ubuntu or the Qwen team; their names belong to them.
+
+
+## Support
+
+The tool is free and stays free. If it saved you time, you can leave a tip:
+[![Tip on Ko-fi](https://img.shields.io/badge/Ko--fi-leave%20a%20tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/localhaven)
+(optional - nothing is unlocked by it).
